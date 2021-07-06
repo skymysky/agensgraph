@@ -25,6 +25,7 @@
 #include "executor/executor.h"
 #include "executor/nodeDijkstra.h"
 #include "executor/tuptable.h"
+#include "funcapi.h"
 #include "lib/pairingheap.h"
 #include "nodes/execnodes.h"
 #include "nodes/memnodes.h"
@@ -32,6 +33,7 @@
 #include "utils/graph.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/typcache.h"
 
 typedef struct vnode
 {
@@ -47,6 +49,9 @@ typedef struct enode
 	vnode	   *prev;
 } enode;
 
+static HeapTuple replace_vertexRow_graphid(TupleDesc tupleDesc,
+										   HeapTuple vertexRow,
+										   Datum graphid);
 static enode *
 new_enode(Graphid id, vnode *prev)
 {
@@ -239,7 +244,7 @@ proj_path(DijkstraState *node)
 	edges = list_delete_cell(edges, null_edge, NULL);
 
 	projInfo = node->ps.ps_ProjInfo;
-	slot = projInfo->pi_slot;
+	slot = projInfo->pi_state.resultslot;
 	econtext = projInfo->pi_exprContext;
 
 	ExecClearTuple(slot);
@@ -274,7 +279,7 @@ compute_limit(DijkstraState *node)
 		Datum		val;
 		bool		is_null;
 
-		val = ExecEvalExprSwitchContext(node->limit, econtext, &is_null, NULL);
+		val = ExecEvalExprSwitchContext(node->limit, econtext, &is_null);
 		if (is_null)
 		{
 			node->max_n = 1;
@@ -294,15 +299,47 @@ compute_limit(DijkstraState *node)
 	}
 }
 
-TupleTableSlot *
-ExecDijkstra(DijkstraState *node)
+/*
+ * Helper function to replace the graphid portion of a vertex
+ * row. It requires the vertex row and tuple descriptor be non NULL and
+ * the attbyval attribute be set. It returns a pointer to the updated
+ * vertex row as a HeapTuple on conclusion.
+ */
+static HeapTuple
+replace_vertexRow_graphid(TupleDesc tupleDesc, HeapTuple vertexRow,
+						  Datum graphid)
 {
+	HeapTupleHeader	vheader;
+	Form_pg_attribute attribute;
+	char			*vgdata;
+
+	/* Verify input constraints */
+	Assert(tupleDesc != NULL);
+	Assert(vertexRow != NULL);
+
+	attribute = tupleDesc->attrs[Anum_vertex_id-1];
+
+	/* This function only works for element 1, graphid, by value */
+	Assert(attribute->attbyval);
+
+	vheader = vertexRow->t_data;
+	vgdata = (char *) vheader + vheader->t_hoff;
+	vgdata = (char *) att_align_nominal(vgdata, attribute->attalign);
+
+	store_att_byval(vgdata, graphid, attribute->attlen);
+
+	return vertexRow;
+}
+
+static TupleTableSlot *
+ExecDijkstra(PlanState *pstate)
+{
+	DijkstraState *node = castNode(DijkstraState, pstate);
 	Dijkstra   *dijkstra;
 	PlanState  *outerPlan;
 	ExprContext *econtext;
 	TupleTableSlot *outerTupleSlot;
 	bool		is_null;
-	ExprDoneCond is_done;
 	Datum		start_vid;
 	dijkstra_pq_entry *start_node;
 	Datum		end_vid;
@@ -330,11 +367,11 @@ ExecDijkstra(DijkstraState *node)
 
 	compute_limit(node);
 
-	start_vid = ExecEvalExpr(node->source, econtext, &is_null, &is_done);
+	start_vid = ExecEvalExpr(node->source, econtext, &is_null);
 	start_node = pq_add(node->pq, node->pq_mcxt, DatumGetGraphid(start_vid),
 						0.0);
 
-	end_vid = ExecEvalExpr(node->target, econtext, &is_null, &is_done);
+	end_vid = ExecEvalExpr(node->target, econtext, &is_null);
 	node->target_id = DatumGetGraphid(end_vid);
 
 	vertex = hash_search(node->visited_nodes, &start_node->to, HASH_ENTER,
@@ -348,6 +385,7 @@ ExecDijkstra(DijkstraState *node)
 		dijkstra_pq_entry *min_pq_entry;
 		vnode	   *frontier;
 		int			paramno;
+		Datum		orig_param;
 		ParamExecData *prm;
 
 		min_pq_entry = (dijkstra_pq_entry *) pairingheap_remove_first(node->pq);
@@ -358,10 +396,25 @@ ExecDijkstra(DijkstraState *node)
 										 &min_pq_entry->to, HASH_FIND, &found);
 		Assert(found);
 
-		paramno = ((Param *) node->source->expr)->paramid;
+		if (IsA(node->source->expr, FieldSelect))
+			paramno = ((Param *) ((FieldSelect *) node->source->expr)->arg)->paramid;
+		else
+			paramno = ((Param *) node->source->expr)->paramid;
 
 		prm = &(econtext->ecxt_param_exec_vals[paramno]);
-		prm->value = UInt64GetDatum(min_pq_entry->to);
+		orig_param = prm->value;
+
+		if (IsA(node->source->expr, FieldSelect))
+		{
+			HeapTuple vertexRow;
+			vertexRow = replace_vertexRow_graphid(node->tupleDesc,
+												  node->vertexRow,
+												  min_pq_entry->to);
+			prm->value = HeapTupleGetDatum(vertexRow);
+		}
+		else
+			prm->value = UInt64GetDatum(min_pq_entry->to);
+
 		outerPlan->chgParam = bms_add_member(outerPlan->chgParam, paramno);
 		ExecReScan(outerPlan);
 
@@ -419,6 +472,11 @@ ExecDijkstra(DijkstraState *node)
 				vnode_add_enode(neighbor, new_weight, eid_val, frontier);
 			}
 		}
+
+		/*
+		 * Parameter is also used in the parent plan, so it must be restored.
+		 */
+		prm->value = orig_param;
 	}
 
 	node->n = node->max_n;
@@ -441,6 +499,7 @@ ExecInitDijkstra(Dijkstra *node, EState *estate, int eflags)
 	dstate = makeNode(DijkstraState);
 	dstate->ps.plan = (Plan *) node;
 	dstate->ps.state = estate;
+	dstate->ps.ExecProcNode = ExecDijkstra;
 
 	/*
 	 * Miscellaneous initialization
@@ -466,12 +525,6 @@ ExecInitDijkstra(Dijkstra *node, EState *estate, int eflags)
 	dstate->limit = ExecInitExpr((Expr *) node->limit, (PlanState *) dstate);
 
 	/*
-	 * initialize child expressions
-	 */
-	dstate->ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->plan.targetlist, (PlanState *) dstate);
-
-	/*
 	 * initialize child nodes
 	 */
 	outerPlan = ExecInitNode(outerPlan(node), estate, eflags);
@@ -483,6 +536,31 @@ ExecInitDijkstra(Dijkstra *node, EState *estate, int eflags)
 	ExecInitResultTupleSlot(estate, &dstate->ps);
 	dstate->selfTupleSlot = ExecInitExtraTupleSlot(estate);
 
+
+	/*
+	 * ExecDijkstra was originally written without expectations that the
+	 * source node might reside in a FieldSelect expression. This code
+	 * is to address that deficit. Additionally, it is added here to
+	 * help with memory conservation by providing a vertex row and the
+	 * tuple descriptor for that vertex row for reuse.
+	 */
+	if (IsA(node->source, FieldSelect))
+	{
+		Datum       values[Natts_vertex] = {0, 0, 0};
+		bool        isnull[Natts_vertex] = {false, true, true};
+		TupleDesc	tupleDesc = lookup_rowtype_tupdesc(VERTEXOID, -1);
+
+		Assert(tupleDesc->natts == Natts_vertex);
+
+		dstate->tupleDesc = tupleDesc;
+		dstate->vertexRow = heap_form_tuple(tupleDesc, values, isnull);
+	}
+	else
+	{
+		dstate->tupleDesc = NULL;
+		dstate->vertexRow = NULL;
+	}
+
 	/*
 	 * initialize tuple type and projection info
 	 */
@@ -491,17 +569,20 @@ ExecInitDijkstra(Dijkstra *node, EState *estate, int eflags)
 
 	ExecSetSlotDescriptor(dstate->selfTupleSlot, ExecGetResultType(outerPlan));
 
-	/*
-	 * finally, wipe the current outer tuple clean.
-	 */
-	dstate->ps.ps_TupFromTlist = false;
-
 	return dstate;
 }
 
 void
 ExecEndDijkstra(DijkstraState *node)
 {
+	/* Release the tuple descriptor in the DijkstraState node */
+	if (node->tupleDesc)
+		ReleaseTupleDesc(node->tupleDesc);
+
+	/* Release the vertexRow container in the DijkstraState node */
+	if (node->vertexRow)
+		heap_freetuple(node->vertexRow);
+
 	/*
 	 * Free the exprcontext
 	 */
